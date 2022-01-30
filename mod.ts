@@ -2,10 +2,9 @@
 /**
  * API client for the Keratin-AuthN server.
  */
-import { verify as verifyJWT, decode as decodeJWT } from "https://deno.land/x/djwt@v2.2/mod.ts";
-import { RSA } from "https://deno.land/x/god_crypto@v1.4.10/rsa.ts"
+import { verify as verifyJWT, decode as decodeJWT } from "https://deno.land/x/djwt@v2.4/mod.ts";
 
-type JSONWebKey = ReturnType<RSA["key"]["jwk"]>;
+type JWK = JsonWebKey & {kid: string};  // The runtime's type definition doesn't include the 'kid' key ID string.
 
 interface Options {
     /** The URL to the authn server from your app's server; not necessarily the public URL. e.g. "http://authn:3000" */
@@ -72,7 +71,7 @@ export class KeratinAuthNClient {
     #appDomain: string;
     #username: string;
     #password: string;
-    #activeKeys: {alg: string, pem: string}[];
+    #activeKeys: CryptoKey[];
     #log: (msg: string) => void;
 
     constructor(options: Options) {
@@ -126,7 +125,7 @@ export class KeratinAuthNClient {
         const checkToken = async () => {
             for (const key of this.#activeKeys) {
                 try {
-                    await verifyJWT(token, key.pem, key.alg as any);
+                    await verifyJWT(token, key);
                     isValid = true;
                 } catch (err) {
                     // This key was not valid. But perhaps another key is.
@@ -263,15 +262,24 @@ export class KeratinAuthNClient {
     }
 
     private async refreshKeys(): Promise<void> {
+        this.#log(`AuthN: Refreshing keys`);
         const response = await this.callApiRaw("get", "/jwks");
         if (response.status !== 200) {
             throw new Error("Unable to fetch new key from AuthN microservice.");
         }
         const keydata = await response.json();
-        this.#log(`AuthN: Refreshed keys (current keys are ${keydata.keys.map((k: JSONWebKey) => k.kid).join(", ")})`);
-        this.#activeKeys = keydata.keys.map((k: JSONWebKey) => ({
-            alg: k.alg,
-            pem: RSA.parseKey(k).pem(),  // We need to convert from JWK format to PEM
-        }));
+        const newActiveKeys: CryptoKey[] = [];
+        for (const key of keydata.keys as JWK[]) {
+            let algorithm: HmacImportParams;
+            if (key.alg === "RS256") {
+                // See https://www.rfc-editor.org/rfc/rfc7518.html#page-6
+                algorithm = {name: "RSASSA-PKCS1-v1_5", hash: {name: "SHA-256"}};
+            } else { throw new Error(`authn-deno deno doesn't know about key algorthithm "${key.alg}"`); }
+            newActiveKeys.push(
+                await crypto.subtle.importKey("jwk", key, algorithm, false, ["verify"])
+            );
+        }
+        this.#activeKeys = newActiveKeys;
+        this.#log(`AuthN: Updated keys are: ${keydata.keys.map((k: JWK) => k.kid).join(", ")}`);
     }
 }
