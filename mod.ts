@@ -2,7 +2,8 @@
 /**
  * API client for the Keratin-AuthN server.
  */
-import { verify as verifyJWT, decode as decodeJWT } from "https://deno.land/x/djwt@v2.4/mod.ts";
+import { verify as verifyJWT, decode as decodeJWT } from "https://deno.land/x/djwt@v2.8/mod.ts";
+import * as log from "https://deno.land/std@0.175.0/log/mod.ts";
 
 type JWK = JsonWebKey & {kid: string};  // The runtime's type definition doesn't include the 'kid' key ID string.
 
@@ -17,8 +18,6 @@ interface Options {
     username: string;
     /** Password for API requests to private Keratin AuthN endpoints. */
     password: string;
-    /** Optional method this class can call to log a string for debugging */
-    debugLogger?: (msg: string) => void;
 }
 
 export interface KeratinAuthNSession {
@@ -72,7 +71,6 @@ export class KeratinAuthNClient {
     #username: string;
     #password: string;
     #activeKeys: CryptoKey[];
-    #log: (msg: string) => void;
 
     constructor(options: Options) {
         this.#authnUrl = options.authnUrl;
@@ -83,11 +81,13 @@ export class KeratinAuthNClient {
         this.#username = options.username;
         this.#password = options.password;
         this.#activeKeys = [];
-        this.#log = options.debugLogger || ((_msg: string) => { console.debug(_msg); });
     }
 
     get authnUrl(): string { return this.#authnUrl; }
     get authnPrivateUrl(): string { return this.#authnPrivateUrl; }
+    private log(msg: string, level: "info"|"debug"|"error" = "info") {
+        log.getLogger("authn-deno")[level](msg);
+    }
 
     /**
      * Validate a session token (would usually be passed as a JWT in the "Authorization" HTTP header).
@@ -96,7 +96,7 @@ export class KeratinAuthNClient {
     public async validateSessionToken(token: string): Promise<KeratinAuthNSession|undefined> {
         // The token must be a (non-empty) string:
         if (!token || typeof token !== "string") {
-            this.#log(`AuthN: Session token ${token} is empty or not a string.`);
+            this.log(`Session token ${token} is empty or not a string.`, "error");
             return undefined;
         }
         // Parse the token
@@ -104,18 +104,18 @@ export class KeratinAuthNClient {
         try {
             data = decodeJWT(token)[1];
         } catch (err) {
-            this.#log(`AuthN: Invalid JWT: ${err}`);
+            this.log(`Invalid JWT: ${err}`, "error");
             return undefined;
         }
         // Check issuer
         if (!urlsEqual(data.iss, this.#authnUrl)) {
-            this.#log(`AuthN: Invalid JWT issuer: ${data.iss} (expected ${this.#authnUrl})`);
+            this.log(`Invalid JWT issuer: ${data.iss} (expected ${this.#authnUrl})`, "error");
             return undefined;
         }
         // Check audience
         const audience = Array.isArray(data.aud) ? data.aud : [data.aud];
         if (!audience.includes(this.#appDomain)) {
-            this.#log(`AuthN: Invalid JWT audience: ${data.aud} (expected ${this.#appDomain})`);
+            this.log(`Invalid JWT audience: ${data.aud} (expected ${this.#appDomain})`, "error");
             return undefined;
         }
 
@@ -140,7 +140,7 @@ export class KeratinAuthNClient {
             await checkToken();
         }
         if (!isValid) {
-            this.#log(`AuthN: JWT Signature validation failed: ${errors}`);
+            this.log(`JWT Signature validation failed: ${errors}`, "error");
             return undefined;
         }
         // Return data
@@ -161,7 +161,7 @@ export class KeratinAuthNClient {
             args = {...args, password: await this._generateRandomPassword()};
         }
         const result = await this.callApi("post", "/accounts/import", args);
-        this.#log(`AuthN: Created user ${args.username}`);
+        this.log(`Created user ${args.username}`, "info");
         return {accountId: result.id};
     }
 
@@ -238,7 +238,7 @@ export class KeratinAuthNClient {
             try {
                 errors = (await result.json()).errors;
             } catch {/* error message could not be parsed as JSON */}
-            this.#log(`AuthN: ${method} to ${url} failed with ${result.status} ${result.statusText} (${msg})`);
+            this.log(`${method} to ${url} failed with ${result.status} ${result.statusText} (${msg})`, "error");
             throw new KeratinAuthNError(result.status, result.statusText, errors);
         }
     }
@@ -262,7 +262,7 @@ export class KeratinAuthNClient {
     }
 
     private async refreshKeys(): Promise<void> {
-        this.#log(`AuthN: Refreshing keys`);
+        this.log(`AuthN: Refreshing keys`, "info");
         const response = await this.callApiRaw("get", "/jwks");
         if (response.status !== 200) {
             throw new Error("Unable to fetch new key from AuthN microservice.");
@@ -280,6 +280,6 @@ export class KeratinAuthNClient {
             );
         }
         this.#activeKeys = newActiveKeys;
-        this.#log(`AuthN: Updated keys are: ${keydata.keys.map((k: JWK) => k.kid).join(", ")}`);
+        this.log(`AuthN: Updated keys are: ${keydata.keys.map((k: JWK) => k.kid).join(", ")}`, "debug");
     }
 }
