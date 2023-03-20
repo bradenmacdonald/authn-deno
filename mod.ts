@@ -64,6 +64,18 @@ function urlsEqual(url1: string, url2: string): boolean {
     );
 }
 
+/** Check the state of a promise */
+function promiseState(
+    promise: Promise<unknown>,
+): Promise<{ status: "fulfilled" | "rejected" | "pending"; value?: unknown; reason?: unknown }> {
+    const pendingState = { status: "pending" as const };
+
+    return Promise.race([promise, pendingState]).then(
+        (value) => value === pendingState ? pendingState : { status: "fulfilled" as const, value },
+        (reason) => ({ status: "rejected" as const, reason }),
+    );
+}
+
 export class KeratinAuthNClient {
     #authnUrl: string;
     #authnPrivateUrl: string;
@@ -71,6 +83,8 @@ export class KeratinAuthNClient {
     #username: string;
     #password: string;
     #activeKeys: CryptoKey[];
+    // A promise used as a lock to avoid fetching the keys in parallel requests
+    #refreshKeysPromise: Promise<void>;
 
     constructor(options: Options) {
         this.#authnUrl = options.authnUrl;
@@ -81,6 +95,7 @@ export class KeratinAuthNClient {
         this.#username = options.username;
         this.#password = options.password;
         this.#activeKeys = [];
+        this.#refreshKeysPromise = Promise.resolve();
     }
 
     get authnUrl(): string { return this.#authnUrl; }
@@ -262,24 +277,32 @@ export class KeratinAuthNClient {
     }
 
     private async refreshKeys(): Promise<void> {
-        this.log(`AuthN: Refreshing keys`, "info");
-        const response = await this.callApiRaw("get", "/jwks");
-        if (response.status !== 200) {
-            throw new Error("Unable to fetch new key from AuthN microservice.");
+        const status = await promiseState(this.#refreshKeysPromise);
+        if (status.status === "pending") {
+            // We are already refreshing the keys, so just wait for it to complete.
+            return this.#refreshKeysPromise;
         }
-        const keydata = await response.json();
-        const newActiveKeys: CryptoKey[] = [];
-        for (const key of keydata.keys as JWK[]) {
-            let algorithm: HmacImportParams;
-            if (key.alg === "RS256") {
-                // See https://www.rfc-editor.org/rfc/rfc7518.html#page-6
-                algorithm = {name: "RSASSA-PKCS1-v1_5", hash: {name: "SHA-256"}};
-            } else { throw new Error(`authn-deno deno doesn't know about key algorthithm "${key.alg}"`); }
-            newActiveKeys.push(
-                await crypto.subtle.importKey("jwk", key, algorithm, false, ["verify"])
-            );
-        }
-        this.#activeKeys = newActiveKeys;
-        this.log(`AuthN: Updated keys are: ${keydata.keys.map((k: JWK) => k.kid).join(", ")}`, "debug");
+        this.#refreshKeysPromise = (async () => {
+            this.log(`Refreshing authn keys`);
+            const response = await this.callApiRaw("get", "/jwks");
+            if (response.status !== 200) {
+                throw new Error("Unable to fetch new key from AuthN microservice.");
+            }
+            const keydata = await response.json();
+            const newActiveKeys: CryptoKey[] = [];
+            for (const key of keydata.keys as JWK[]) {
+                let algorithm: HmacImportParams;
+                if (key.alg === "RS256") {
+                    // See https://www.rfc-editor.org/rfc/rfc7518.html#page-6
+                    algorithm = {name: "RSASSA-PKCS1-v1_5", hash: {name: "SHA-256"}};
+                } else { throw new Error(`authn-deno deno doesn't know about key algorthithm "${key.alg}"`); }
+                newActiveKeys.push(
+                    await crypto.subtle.importKey("jwk", key, algorithm, false, ["verify"])
+                );
+            }
+            this.#activeKeys = newActiveKeys;
+            this.log(`Updated keys are: ${keydata.keys.map((k: JWK) => k.kid).join(", ")}`, "debug");
+        })();
+        return this.#refreshKeysPromise;
     }
 }
